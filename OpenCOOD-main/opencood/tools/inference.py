@@ -1,0 +1,239 @@
+# -*- coding: utf-8 -*-
+# Author: Runsheng Xu <rxx3386@ucla.edu>, Hao Xiang <haxiang@g.ucla.edu>, Yifan Lu <yifan_lu@sjtu.edu.cn>
+# License: TDG-Attribution-NonCommercial-NoDistrib
+
+
+import argparse
+import os
+import time
+from tqdm import tqdm
+
+import torch
+import open3d as o3d
+from torch.utils.data import DataLoader
+
+import opencood.hypes_yaml.yaml_utils as yaml_utils
+from opencood.tools import train_utils, inference_utils
+from opencood.data_utils.datasets import build_dataset
+from opencood.utils import eval_utils
+from opencood.visualization import vis_utils
+import matplotlib.pyplot as plt
+
+
+def test_parser():
+    parser = argparse.ArgumentParser(description="synthetic data generation")
+    parser.add_argument('--model_dir', type=str, required=True,
+                        help='Continued training path')
+    parser.add_argument('--fusion_method', required=True, type=str,
+                        default='intermediate',
+                        help='late, early or intermediate')
+    parser.add_argument('--show_vis', action='store_true',
+                        help='whether to show image visualization result')
+    parser.add_argument('--show_sequence', action='store_true',
+                        help='whether to show video visualization result.'
+                             'it can note be set true with show_vis together ')
+    parser.add_argument('--save_vis', action='store_true',
+                        help='whether to save visualization result')
+    parser.add_argument('--save_npy', action='store_true',
+                        help='whether to save prediction and gt result'
+                             'in npy_test file')
+    parser.add_argument('--global_sort_detections', action='store_true',
+                        help='whether to globally sort detections by confidence score.'
+                             'If set to True, it is the mainstream AP computing method,'
+                             'but would increase the tolerance for FP (False Positives).')
+    opt = parser.parse_args()
+    return opt
+
+
+def main():
+    # opt = test_parser()
+
+    # ========== 参数定义 ==========
+    # 模型路径（修改为你的模型路径）
+    model_dir = 'pointpillar_fcooper'
+    # model_dir = "second_attentive_fusion"
+
+    # 融合方法，可选 'late', 'early', 'intermediate'
+    fusion_method = 'intermediate'
+
+    # 可视化选项
+    show_vis = False  # 是否显示可视化结果
+    show_sequence = False  # 是否以视频流形式显示结果（不能与show_vis同时为True）
+    save_vis = False  # 是否保存可视化结果
+    save_npy = True  # 是否保存预测和GT结果为npy文件
+    global_sort_detections = False  # 是否全局按置信度排序检测结果
+
+    # assert opt.fusion_method in ['late', 'early', 'intermediate']
+    assert fusion_method in ['late', 'early', 'intermediate']
+    assert not (show_vis and show_sequence), 'you can only visualize ' \
+                                                    'the results in single ' \
+                                                    'image mode or video mode'
+
+    # 从模型目录加载配置文件
+    hypes_path = os.path.join(model_dir, 'config.yaml')
+    hypes = yaml_utils.load_yaml(hypes_path, None)
+
+    print('Dataset Building')
+    opencood_dataset = build_dataset(hypes, visualize=True, train=False)
+    print(f"{len(opencood_dataset)} samples found.")
+    data_loader = DataLoader(opencood_dataset,
+                             batch_size=1,
+                             # num_workers=16,
+                             num_workers = 0,
+                             collate_fn=opencood_dataset.collate_batch_test,
+                             shuffle=False,
+                             pin_memory=False,
+                             drop_last=False,
+                             )
+
+    # data_loader = DataLoader(opencood_dataset, num_workers=0)  # 关闭多进程
+
+    print('Creating Model')
+    model = train_utils.create_model(hypes)
+    # we assume gpu is necessary
+    if torch.cuda.is_available():
+        model.cuda()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    print('Loading Model from checkpoint')
+    _, model = train_utils.load_saved_model(model_dir, model)
+    model.eval()
+
+    # Create the dictionary for evaluation.
+    # also store the confidence score for each prediction
+    result_stat = {0.3: {'tp': [], 'fp': [], 'gt': 0, 'score': []},                
+                   0.5: {'tp': [], 'fp': [], 'gt': 0, 'score': []},                
+                   0.7: {'tp': [], 'fp': [], 'gt': 0, 'score': []}}
+
+    if show_sequence:
+        vis = o3d.visualization.Visualizer()
+        vis.create_window()
+
+        vis.get_render_option().background_color = [0.05, 0.05, 0.05]
+        vis.get_render_option().point_size = 1.0
+        vis.get_render_option().show_coordinate_frame = True
+
+        # used to visualize lidar points
+        vis_pcd = o3d.geometry.PointCloud()
+        # used to visualize object bounding box, maximum 50
+        vis_aabbs_gt = []
+        vis_aabbs_pred = []
+        for _ in range(50):
+            vis_aabbs_gt.append(o3d.geometry.LineSet())
+            vis_aabbs_pred.append(o3d.geometry.LineSet())
+
+    for i, batch_data in tqdm(enumerate(data_loader)):
+        with torch.no_grad():
+            batch_data = train_utils.to_device(batch_data, device)
+
+            # pred_box_tensor：形状为Tensor(4,8,3);
+            # 三个维度表示：第一维：检测到的物体数量，当前数据包含 4 个物体，对应 4 个边界框（每个子数组代表一个物体）；
+            # 第二维表示单个物体的 8 个角点坐标，对应三维边界框的 8 个顶点。通常由底面和顶面的 4 个角点构成（上下层各 4 个点）
+            # 第三维表示每个角点的 三维坐标 (x, y, z)，遵循右手坐标系规则（x: 前向，y: 左侧，z: 垂直向上）
+            # 中心点坐标的计算：取底面四个角的平均值
+            # 预测得分：pred_score数组，表示模型对每个检测框的置信度（0~1之间的概率值），
+            #          用于后续的非极大值抑制(NMS)和TP/FP计算
+            # 真值框(GT Box)：gt_box_tensor：包含人工标注的真实边界框参数，与预测框进行IoU计算生成TP/FP统计
+
+            if fusion_method == 'late':
+                pred_box_tensor, pred_score, gt_box_tensor = \
+                    inference_utils.inference_late_fusion(batch_data,
+                                                          model,
+                                                          opencood_dataset)
+            elif fusion_method == 'early':
+                pred_box_tensor, pred_score, gt_box_tensor = \
+                    inference_utils.inference_early_fusion(batch_data,
+                                                           model,
+                                                           opencood_dataset)
+            elif fusion_method == 'intermediate':
+                pred_box_tensor, pred_score, gt_box_tensor = \
+                    inference_utils.inference_intermediate_fusion(batch_data,
+                                                                  model,
+                                                                  opencood_dataset)
+            else:
+                raise NotImplementedError('Only early, late and intermediate'
+                                          'fusion is supported.')
+
+            eval_utils.caluclate_tp_fp(pred_box_tensor,
+                                       pred_score,
+                                       gt_box_tensor,
+                                       result_stat,
+                                       0.3)
+            eval_utils.caluclate_tp_fp(pred_box_tensor,
+                                       pred_score,
+                                       gt_box_tensor,
+                                       result_stat,
+                                       0.5)
+            eval_utils.caluclate_tp_fp(pred_box_tensor,
+                                       pred_score,
+                                       gt_box_tensor,
+                                       result_stat,
+                                       0.7)
+            if save_npy:
+                npy_save_path = os.path.join(model_dir, 'npy')
+                if not os.path.exists(npy_save_path):
+                    os.makedirs(npy_save_path)
+                inference_utils.save_prediction_gt(pred_box_tensor,
+                                                   gt_box_tensor,
+                                                   batch_data['ego'][
+                                                       'origin_lidar'][0],
+                                                   i,
+                                                   npy_save_path)
+
+            if show_vis or save_vis:
+                vis_save_path = ''
+                if save_vis:
+                    vis_save_path = os.path.join(model_dir, 'vis')
+                    if not os.path.exists(vis_save_path):
+                        os.makedirs(vis_save_path)
+                    vis_save_path = os.path.join(vis_save_path, '%05d.png' % i)
+
+                opencood_dataset.visualize_result(pred_box_tensor,
+                                                  gt_box_tensor,
+                                                  batch_data['ego'][
+                                                      'origin_lidar'],
+                                                  show_vis,
+                                                  vis_save_path,
+                                                  dataset=opencood_dataset)
+
+            if show_sequence:
+                pcd, pred_o3d_box, gt_o3d_box = \
+                    vis_utils.visualize_inference_sample_dataloader(
+                        pred_box_tensor,
+                        gt_box_tensor,
+                        batch_data['ego']['origin_lidar'],
+                        vis_pcd,
+                        mode='constant'
+                        )
+                if i == 0:
+                    vis.add_geometry(pcd)
+                    vis_utils.linset_assign_list(vis,
+                                                 vis_aabbs_pred,
+                                                 pred_o3d_box,
+                                                 update_mode='add')
+
+                    vis_utils.linset_assign_list(vis,
+                                                 vis_aabbs_gt,
+                                                 gt_o3d_box,
+                                                 update_mode='add')
+
+                vis_utils.linset_assign_list(vis,
+                                             vis_aabbs_pred,
+                                             pred_o3d_box)
+                vis_utils.linset_assign_list(vis,
+                                             vis_aabbs_gt,
+                                             gt_o3d_box)
+                vis.update_geometry(pcd)
+                vis.poll_events()
+                vis.update_renderer()
+                time.sleep(0.001)
+
+    eval_utils.eval_final_results(result_stat,
+                                  model_dir,
+                                  global_sort_detections)
+    if show_sequence:
+        vis.destroy_window()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,49 @@
+description: |-
+
+# define the carla traffic
+carla_traffic_manager:
+  vehicle_list:
+    - spawn_position: [ -940, 8.75, 0.3, 0, 0, 0 ]
+      vehicle_speed_perc: 10
+#    - spawn_position: [ -920, 5.25, 0.3, 0, 0, 0 ]
+#      vehicle_speed_perc: 20
+    - spawn_position: [ -890, 5.25, 0.3, 0, 0, 0 ]
+      vehicle_speed_perc: 10
+#    - spawn_position: [ -880, 8.75, 0.3, 0, 0, 0 ]
+#      vehicle_speed_perc: 20
+
+
+scenario:
+  single_cav_list:
+    # 第一辆车（原配置）
+    - name: cav1
+      spawn_position: [ -980, 8.75, 0.3, 0, 0, 0 ]
+      destination: [ -100, 8.75, 0.3 ]
+      v2x:
+        communication_range: 100
+      behavior:
+        local_planner:
+          debug_trajectory: true
+          debug: true
+
+    # 新增第二辆车
+    - name: cav2
+      spawn_position: [ -960, 5.25, 0.3, 0, 0, 0 ]  # 调整到左侧车道
+      destination: [ -100, 5.25, 0.3 ]               # 目的地对应左侧车道
+      v2x:
+        communication_range: 100
+      behavior:
+        local_planner:
+          debug_trajectory: true
+          debug: true
+
+    # 新增第三辆车
+    - name: cav3
+      spawn_position: [ -950, 8.75, 0.3, 0, 0, 0 ]  # 同一车道，但更靠前
+      destination: [ -100, 8.75, 0.3 ]               # 目的地与cav1相同
+      v2x:
+        communication_range: 100
+      behavior:
+        local_planner:
+          debug_trajectory: true
+          debug: true
